@@ -6,6 +6,7 @@ import (
 	"raim/internal/sim"
 	"raim/pkg/chisq"
 	"raim/pkg/detect"
+	"raim/pkg/gnss"
 	"raim/pkg/lsq"
 	"raim/pkg/protect"
 )
@@ -70,5 +71,37 @@ func TestHPLZeroWhenNoRedundancy(t *testing.T) {
 	}
 	if h := protect.AssessmentHPL(a, 1e-3); h != 0 {
 		t.Fatalf("无冗余时 HPL 应为 0（不可用）, got %v", h)
+	}
+}
+
+func TestHPLMultiSystem(t *testing.T) {
+	// 多模（3 系统、各 9 颗）：HPL 为正、有限；排除后仍为正。
+	rec := sim.DefaultReceiver()
+	c := sim.MultiSky(rec, []gnss.System{gnss.GPS, gnss.GAL, gnss.BDS}, 9, 15, 2026)
+	ep := c.ObserveMulti(sim.MultiObs{Sigma: 1})
+	sol, err := lsq.Solve(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sse, dof := lsq.WeightedSSEDOF(sol.Resid, sol.Sigma, 3+len(sol.Systems))
+	_ = sse
+	thr := chisq.Threshold(dof, 1e-5)
+	h := protect.HPL(sol, dof, thr, 1e-3)
+	if !(h > 0 && h < 1e6) {
+		t.Fatalf("多模 HPL 应为正且有限, got %v (dof=%d)", h, dof)
+	}
+
+	// 单星故障排除后的 HPL 仍为正
+	a, err := detect.Assess(c.ObserveMulti(sim.MultiObs{
+		Bias: map[gnss.SatID]float64{gnss.Key(gnss.GPS, 4): 90},
+	}), detect.Options{Pfa: 1e-5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Mode != detect.ModeExcluded {
+		t.Fatalf("应排除 GPS:4, got %v", a.Mode)
+	}
+	if he := protect.AssessmentHPL(a, 1e-3); !(he > 0) {
+		t.Fatalf("多模排除后 HPL 应为正, got %v", he)
 	}
 }

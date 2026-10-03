@@ -24,6 +24,17 @@ func main() {
 	seed := flag.Int64("seed", 20260930, "固定随机种子")
 	flag.Parse()
 
+	out := run(*seed)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(out); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run 执行全部回放场景并返回结果（从 main 抽出，便于黄金文件测试）。
+func run(seed int64) map[string]map[string]any {
 	modeProfiles := map[string]profile.Profile{}
 	base := func(name string, mode profile.AlertMode, gross float64) profile.Profile {
 		return profile.Profile{
@@ -39,7 +50,7 @@ func main() {
 
 	// 8 颗星：自由度 4，SSE 分布较集中；演示关注三种告警判定的差异。
 	rec := sim.DefaultReceiver()
-	c := sim.EvenSky(rec, 8, 20, *seed)
+	c := sim.EvenSky(rec, 8, 20, seed)
 
 	type scenario struct {
 		name      string
@@ -96,7 +107,7 @@ func main() {
 
 	out := map[string]map[string]any{}
 	for _, sc := range scenarios {
-		epochs := gen(c, sc.n, *seed, sc.biasAt)
+		epochs := gen(c, sc.n, seed, sc.biasAt)
 		res := map[string]any{}
 		for name, p := range modeProfiles {
 			svc := session.NewService([]profile.Profile{p})
@@ -138,13 +149,7 @@ func main() {
 		}
 		out[sc.name] = res
 	}
-
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(out); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	return out
 }
 
 // classifyEpisodes 把逐历元告警序列切成连续片段，并按“片段是否覆盖真实

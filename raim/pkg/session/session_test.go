@@ -11,6 +11,8 @@ import (
 
 	"raim/internal/sim"
 	"raim/pkg/apierr"
+	"raim/pkg/detect"
+	"raim/pkg/gnss"
 	"raim/pkg/lsq"
 	"raim/pkg/profile"
 	"raim/pkg/session"
@@ -79,7 +81,7 @@ func assertStateEqual(t *testing.T, a, b *session.Session) {
 	for id, ea := range a.State.Isolated {
 		eb := b.State.Isolated[id]
 		if eb == nil || *ea != *eb {
-			t.Fatalf("隔离星 %d 状态不同: %+v vs %+v", id, ea, eb)
+			t.Fatalf("隔离星 %v 状态不同: %+v vs %+v", id, ea, eb)
 		}
 	}
 	if a.State.Alert != b.State.Alert {
@@ -87,12 +89,12 @@ func assertStateEqual(t *testing.T, a, b *session.Session) {
 	}
 }
 
-func sortedIsolatedIDs(s *session.Session) []int {
-	var ids []int
+func sortedIsolatedIDs(s *session.Session) []gnss.SatID {
+	var ids []gnss.SatID
 	for id := range s.State.Isolated {
 		ids = append(ids, id)
 	}
-	sort.Ints(ids)
+	sort.Slice(ids, func(i, j int) bool { return gnss.Compare(ids[i], ids[j]) < 0 })
 	return ids
 }
 
@@ -275,34 +277,26 @@ func TestIsolationHoldAndRecover(t *testing.T) {
 	// 从下一历元起到偏差结束（历元12）始终隔离、且不参与解算（不反复进出）
 	for i := 5; i <= 11; i++ {
 		r := recs[i]
-		if !contains(r.Isolated, badID) {
+		if !containsRef(r.Isolated, gnss.GPS, badID) {
 			t.Fatalf("历元 %d 坏星不应被拉回（隔离列表=%v）", i+1, r.Isolated)
 		}
-		for _, sr := range r.SatResults {
-			if sr.ID == badID {
-				t.Fatalf("历元 %d 隔离星竟参与解算", i+1)
-			}
+		if satResParticipates(r.SatResults, gnss.GPS, badID) {
+			t.Fatalf("历元 %d 隔离星竟参与解算", i+1)
 		}
 	}
 	// 偏差撤掉（历元13=seq12 起）：连续 minIso 个历元自身正常且加回通过，
 	// 历元13/14/15 streak=1/2/3 仍隔离，历元16 streak=4 解除。
 	for i := 12; i <= 14; i++ {
-		if !contains(recs[i].Isolated, badID) {
+		if !containsRef(recs[i].Isolated, gnss.GPS, badID) {
 			t.Fatalf("历元 %d 恢复期未满，应仍隔离", i+1)
 		}
 	}
 	recoverEpoch := 15 // 0-based：历元16
-	if contains(recs[recoverEpoch].Isolated, badID) {
+	if containsRef(recs[recoverEpoch].Isolated, gnss.GPS, badID) {
 		t.Fatalf("历元 %d 应已解除隔离", recoverEpoch+1)
 	}
 	// 恢复历元的活动星集合在解除前已确定，故该星在下一历元重新参与解算
-	found := false
-	for _, sr := range recs[recoverEpoch+1].SatResults {
-		if sr.ID == badID {
-			found = true
-		}
-	}
-	if !found {
+	if !satResParticipates(recs[recoverEpoch+1].SatResults, gnss.GPS, badID) {
 		t.Fatal("恢复后下一历元坏星应重新参与解算")
 	}
 	// 故障期间位置始终在真值附近（隔离生效，未被坏星带偏）
@@ -379,9 +373,18 @@ func TestBatchFieldErrorPrefixed(t *testing.T) {
 	}
 }
 
-func contains(xs []int, v int) bool {
+func containsRef(xs []gnss.SatRef, sys gnss.System, id int) bool {
 	for _, x := range xs {
-		if x == v {
+		if x.System == sys && x.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func satResParticipates(rs []detect.SatResult, sys gnss.System, id int) bool {
+	for _, r := range rs {
+		if r.System == sys && r.ID == id {
 			return true
 		}
 	}

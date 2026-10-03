@@ -1,6 +1,6 @@
 // Package statem 实现跨历元的两类持续性状态：
 //
-//  1. 故障星隔离/恢复计数（卫星级）：
+//  1. 故障星隔离/恢复计数（卫星级，按“系统+编号”区分）：
 //     被排除的星进入隔离；此后须连续 MinEpochs 个历元“本星残差正常且
 //     加回后整体检验通过”才解除。星不可见或任一条件不满足，计数清零重来。
 //
@@ -11,15 +11,23 @@
 //     撤警仍走窗口（保证恢复确认）。
 //
 // 状态机本身不做任何 GNSS 计算，输入是上层算好的每历元事件，便于单测与复用。
+// 多模时间偏差在本实现中按历元自由估计（不跨历元携带），因此这里没有
+// 额外的钟差状态；选型理由见 docs/design.md。
 package statem
 
-import "raim/pkg/profile"
+import (
+	"encoding/json"
+
+	"raim/pkg/gnss"
+	"raim/pkg/profile"
+)
 
 // IsolationEntry 记录一颗隔离星的恢复计数。
 type IsolationEntry struct {
-	ID            int `json:"id"`
-	NormalStreak  int `json:"normal_streak"`   // 连续正常（且加回通过）历元数
-	SinceEpochSeq int `json:"since_epoch_seq"` // 从第几个历元开始隔离
+	System        gnss.System `json:"-"`
+	ID            int         `json:"id"`
+	NormalStreak  int         `json:"normal_streak"`   // 连续正常（且加回通过）历元数
+	SinceEpochSeq int         `json:"since_epoch_seq"` // 从第几个历元开始隔离
 }
 
 // AlertMachine 是告警持续状态机。
@@ -32,40 +40,84 @@ type AlertMachine struct {
 
 // State 是会话内跨历元的全部持久状态。
 type State struct {
-	Isolated map[int]*IsolationEntry `json:"isolated"`
-	Alert    AlertMachine            `json:"alert"`
+	Isolated map[gnss.SatID]*IsolationEntry `json:"-"`
+	Alert    AlertMachine                   `json:"alert"`
+}
+
+// stateJSON 是 State 的落盘形态：隔离星以 "GPS:4" 文本为键，
+// 旧版本裸编号键（"4"）反序列化时按 GPS 处理。
+type stateJSON struct {
+	Isolated map[string]*IsolationEntry `json:"isolated"`
+	Alert    AlertMachine               `json:"alert"`
+}
+
+// MarshalJSON 用紧凑文本键落盘隔离集合。
+func (s State) MarshalJSON() ([]byte, error) {
+	v := stateJSON{Isolated: map[string]*IsolationEntry{}, Alert: s.Alert}
+	for k, e := range s.Isolated {
+		// 防御性：条目的系统与其键保持一致
+		cp := *e
+		if cp.System == "" {
+			cp.System = k.System
+		}
+		v.Isolated[k.String()] = &cp
+	}
+	return json.Marshal(v)
+}
+
+// UnmarshalJSON 兼容升级前的裸编号隔离状态（按 GPS）。
+func (s *State) UnmarshalJSON(b []byte) error {
+	var v stateJSON
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	s.Alert = v.Alert
+	s.Isolated = map[gnss.SatID]*IsolationEntry{}
+	for key, e := range v.Isolated {
+		var k gnss.SatID
+		if err := k.UnmarshalText([]byte(key)); err != nil {
+			return err
+		}
+		if e.System == "" {
+			e.System = k.System
+		}
+		s.Isolated[k] = e
+	}
+	return nil
 }
 
 // NewState 创建空状态。
 func NewState() State {
-	return State{Isolated: map[int]*IsolationEntry{}}
+	return State{Isolated: map[gnss.SatID]*IsolationEntry{}}
 }
 
 // SatRecovery 是上层对某颗隔离星在本历元的恢复评估结果。
 type SatRecovery struct {
-	ID     int
+	Sat    gnss.SatID
 	Normal bool // 本星残差正常 且 加回后整体检验通过
 }
 
 // UpdateIsolation 推进卫星隔离状态。
 //
-//	excludedNow: 本历元新被排除的星（0 表示无）——进入隔离，计数清零。
+//	excludedNow: 本历元新被排除的星（零值表示无）——进入隔离，计数清零。
 //	recovery:   对当前已隔离且本历元可见的星的评估。
 //	visible:    本历元可见星集合（隔离星不可见则计数清零）。
 //	seq:        历元序号（仅用于记录起始）。
 //
-// 返回本历元仍处于隔离的星编号集合。
-func (s *State) UpdateIsolation(prof profile.Profile, excludedNow int, recovery []SatRecovery,
-	visible map[int]bool, seq int) map[int]bool {
+// 返回本历元仍处于隔离的星集合。
+func (s *State) UpdateIsolation(prof profile.Profile, excludedNow gnss.SatID,
+	recovery []SatRecovery, visible map[gnss.SatID]bool, seq int) map[gnss.SatID]bool {
 
-	if excludedNow != 0 {
-		s.Isolated[excludedNow] = &IsolationEntry{ID: excludedNow, SinceEpochSeq: seq}
+	if excludedNow.ID != 0 {
+		s.Isolated[excludedNow] = &IsolationEntry{
+			System: excludedNow.System, ID: excludedNow.ID, SinceEpochSeq: seq,
+		}
 	}
-	recMap := map[int]bool{}
+	recMap := map[gnss.SatID]bool{}
 	for _, r := range recovery {
-		recMap[r.ID] = r.Normal
+		recMap[r.Sat] = r.Normal
 	}
-	still := map[int]bool{}
+	still := map[gnss.SatID]bool{}
 	for id, e := range s.Isolated {
 		if id == excludedNow {
 			still[id] = true

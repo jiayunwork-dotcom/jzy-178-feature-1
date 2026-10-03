@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"raim/pkg/apierr"
+	"raim/pkg/gnss"
 	"raim/pkg/profile"
 	"raim/pkg/statem"
 )
@@ -145,7 +146,7 @@ func (st *Store) GetSession(id string) (*Session, error) {
 		return nil, err
 	}
 	if sess.State.Isolated == nil {
-		sess.State.Isolated = map[int]*statem.IsolationEntry{}
+		sess.State.Isolated = map[gnss.SatID]*statem.IsolationEntry{}
 	}
 	return &sess, nil
 }
@@ -270,7 +271,7 @@ func sanitize(name string) string {
 func cloneState(s statem.State) statem.State {
 	out := statem.State{
 		Alert:    s.Alert,
-		Isolated: map[int]*statem.IsolationEntry{},
+		Isolated: map[gnss.SatID]*statem.IsolationEntry{},
 	}
 	for id, e := range s.Isolated {
 		cp := *e
