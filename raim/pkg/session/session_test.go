@@ -11,6 +11,7 @@ import (
 
 	"raim/internal/sim"
 	"raim/pkg/apierr"
+	"raim/pkg/gnss"
 	"raim/pkg/lsq"
 	"raim/pkg/profile"
 	"raim/pkg/session"
@@ -76,10 +77,10 @@ func assertStateEqual(t *testing.T, a, b *session.Session) {
 		t.Fatalf("隔离星数量不同: %v vs %v",
 			sortedIsolatedIDs(a), sortedIsolatedIDs(b))
 	}
-	for id, ea := range a.State.Isolated {
-		eb := b.State.Isolated[id]
+	for k, ea := range a.State.Isolated {
+		eb := b.State.Isolated[k]
 		if eb == nil || *ea != *eb {
-			t.Fatalf("隔离星 %d 状态不同: %+v vs %+v", id, ea, eb)
+			t.Fatalf("隔离星 %s 状态不同: %+v vs %+v", k, ea, eb)
 		}
 	}
 	if a.State.Alert != b.State.Alert {
@@ -87,12 +88,12 @@ func assertStateEqual(t *testing.T, a, b *session.Session) {
 	}
 }
 
-func sortedIsolatedIDs(s *session.Session) []int {
-	var ids []int
-	for id := range s.State.Isolated {
-		ids = append(ids, id)
+func sortedIsolatedIDs(s *session.Session) []gnss.SatKey {
+	var ids []gnss.SatKey
+	for k := range s.State.Isolated {
+		ids = append(ids, k)
 	}
-	sort.Ints(ids)
+	sort.Slice(ids, func(i, j int) bool { return gnss.Less(ids[i], ids[j]) })
 	return ids
 }
 

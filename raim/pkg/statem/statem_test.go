@@ -3,6 +3,7 @@ package statem_test
 import (
 	"testing"
 
+	"raim/pkg/gnss"
 	"raim/pkg/profile"
 	"raim/pkg/statem"
 )
@@ -15,6 +16,9 @@ func profWith(mode profile.AlertMode, confirm, clear int, gross float64) profile
 	}
 	return p
 }
+
+// sat5 是这些用例里被隔离的星（GPS 5 号），升级前就是裸编号 5。
+var sat5 = gnss.Key(gnss.GPS, 5)
 
 func TestSnapshotAlertsImmediately(t *testing.T) {
 	s := statem.NewState()
@@ -74,22 +78,22 @@ func TestCombinedImmediateOnGross(t *testing.T) {
 func TestIsolationRecoveryCount(t *testing.T) {
 	s := statem.NewState()
 	p := profWith(profile.Persistence, 3, 2, 0)
-	vis := map[int]bool{5: true}
+	vis := map[gnss.SatKey]bool{sat5: true}
 	// 第 1 历元排除 5 号星
-	still := s.UpdateIsolation(p, 5, nil, vis, 1)
-	if !still[5] {
+	still := s.UpdateIsolation(p, sat5, nil, vis, 1)
+	if !still[sat5] {
 		t.Fatal("刚排除应处于隔离")
 	}
 	// 连续 2 个历元正常：仍隔离
 	for i := 0; i < 2; i++ {
-		still = s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, i+2)
+		still = s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, i+2)
 	}
-	if !still[5] {
+	if !still[sat5] {
 		t.Fatal("未满 3 个历元不应恢复")
 	}
 	// 第 3 个正常历元：恢复
-	still = s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 4)
-	if still[5] {
+	still = s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 4)
+	if still[sat5] {
 		t.Fatal("连续 3 历元正常应解除隔离")
 	}
 }
@@ -97,14 +101,14 @@ func TestIsolationRecoveryCount(t *testing.T) {
 func TestIsolationAbnormalResetsStreak(t *testing.T) {
 	s := statem.NewState()
 	p := profWith(profile.Persistence, 3, 2, 0)
-	vis := map[int]bool{5: true}
-	s.UpdateIsolation(p, 5, nil, vis, 1)
-	s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 2)
+	vis := map[gnss.SatKey]bool{sat5: true}
+	s.UpdateIsolation(p, sat5, nil, vis, 1)
+	s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 2)
 	// 一个不正常历元：清零
-	s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: false}}, vis, 3)
-	s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 4)
-	still := s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 5)
-	if !still[5] {
+	s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: false}}, vis, 3)
+	s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 4)
+	still := s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 5)
+	if !still[sat5] {
 		t.Fatal("计数被重置后只连续 2 历元，不应恢复")
 	}
 }
@@ -112,14 +116,14 @@ func TestIsolationAbnormalResetsStreak(t *testing.T) {
 func TestIsolationInvisibleResetsStreak(t *testing.T) {
 	s := statem.NewState()
 	p := profWith(profile.Persistence, 3, 2, 0)
-	vis := map[int]bool{5: true}
-	s.UpdateIsolation(p, 5, nil, vis, 1)
-	s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 2)
+	vis := map[gnss.SatKey]bool{sat5: true}
+	s.UpdateIsolation(p, sat5, nil, vis, 1)
+	s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 2)
 	// 该星本历元不可见：计数清零
-	s.UpdateIsolation(p, 0, nil, map[int]bool{}, 3)
-	s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 4)
-	still := s.UpdateIsolation(p, 0, []statem.SatRecovery{{ID: 5, Normal: true}}, vis, 5)
-	if !still[5] {
+	s.UpdateIsolation(p, gnss.SatKey{}, nil, map[gnss.SatKey]bool{}, 3)
+	s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 4)
+	still := s.UpdateIsolation(p, gnss.SatKey{}, []statem.SatRecovery{{Sat: sat5, Normal: true}}, vis, 5)
+	if !still[sat5] {
 		t.Fatal("不可见打断连续性，只连续 2 历元不应恢复")
 	}
 }

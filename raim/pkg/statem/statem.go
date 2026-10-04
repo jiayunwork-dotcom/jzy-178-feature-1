@@ -1,8 +1,9 @@
 // Package statem 实现跨历元的两类持续性状态：
 //
-//  1. 故障星隔离/恢复计数（卫星级）：
+//  1. 故障星隔离/恢复计数（卫星级，按“系统+编号”区分）：
 //     被排除的星进入隔离；此后须连续 MinEpochs 个历元“本星残差正常且
 //     加回后整体检验通过”才解除。星不可见或任一条件不满足，计数清零重来。
+//     GPS 3 号与北斗 3 号是两颗不同的星，隔离状态分别保存。
 //
 //  2. 告警状态（系统级）：
 //     - snapshot：一个历元超限即告警，下一个历元正常即撤警；
@@ -13,13 +14,16 @@
 // 状态机本身不做任何 GNSS 计算，输入是上层算好的每历元事件，便于单测与复用。
 package statem
 
-import "raim/pkg/profile"
+import (
+	"raim/pkg/gnss"
+	"raim/pkg/profile"
+)
 
 // IsolationEntry 记录一颗隔离星的恢复计数。
 type IsolationEntry struct {
-	ID            int `json:"id"`
-	NormalStreak  int `json:"normal_streak"`   // 连续正常（且加回通过）历元数
-	SinceEpochSeq int `json:"since_epoch_seq"` // 从第几个历元开始隔离
+	Sat           gnss.SatKey `json:"sat"`
+	NormalStreak  int         `json:"normal_streak"`   // 连续正常（且加回通过）历元数
+	SinceEpochSeq int         `json:"since_epoch_seq"` // 从第几个历元开始隔离
 }
 
 // AlertMachine 是告警持续状态机。
@@ -31,41 +35,44 @@ type AlertMachine struct {
 }
 
 // State 是会话内跨历元的全部持久状态。
+//
+// 系统时间偏差按“每历元自由未知量”估计（见 docs/design.md），
+// 故这里没有任何跨历元的钟差/ISB 状态；跨历元状态只有隔离集合与告警机。
 type State struct {
-	Isolated map[int]*IsolationEntry `json:"isolated"`
-	Alert    AlertMachine            `json:"alert"`
+	Isolated map[gnss.SatKey]*IsolationEntry `json:"isolated"`
+	Alert    AlertMachine                    `json:"alert"`
 }
 
 // NewState 创建空状态。
 func NewState() State {
-	return State{Isolated: map[int]*IsolationEntry{}}
+	return State{Isolated: map[gnss.SatKey]*IsolationEntry{}}
 }
 
 // SatRecovery 是上层对某颗隔离星在本历元的恢复评估结果。
 type SatRecovery struct {
-	ID     int
+	Sat    gnss.SatKey
 	Normal bool // 本星残差正常 且 加回后整体检验通过
 }
 
 // UpdateIsolation 推进卫星隔离状态。
 //
-//	excludedNow: 本历元新被排除的星（0 表示无）——进入隔离，计数清零。
+//	excludedNow: 本历元新被排除的星（零值表示无）——进入隔离，计数清零。
 //	recovery:   对当前已隔离且本历元可见的星的评估。
 //	visible:    本历元可见星集合（隔离星不可见则计数清零）。
 //	seq:        历元序号（仅用于记录起始）。
 //
-// 返回本历元仍处于隔离的星编号集合。
-func (s *State) UpdateIsolation(prof profile.Profile, excludedNow int, recovery []SatRecovery,
-	visible map[int]bool, seq int) map[int]bool {
+// 返回本历元仍处于隔离的星主键集合。
+func (s *State) UpdateIsolation(prof profile.Profile, excludedNow gnss.SatKey, recovery []SatRecovery,
+	visible map[gnss.SatKey]bool, seq int) map[gnss.SatKey]bool {
 
-	if excludedNow != 0 {
-		s.Isolated[excludedNow] = &IsolationEntry{ID: excludedNow, SinceEpochSeq: seq}
+	if excludedNow != (gnss.SatKey{}) {
+		s.Isolated[excludedNow] = &IsolationEntry{Sat: excludedNow, SinceEpochSeq: seq}
 	}
-	recMap := map[int]bool{}
+	recMap := map[gnss.SatKey]bool{}
 	for _, r := range recovery {
-		recMap[r.ID] = r.Normal
+		recMap[r.Sat] = r.Normal
 	}
-	still := map[int]bool{}
+	still := map[gnss.SatKey]bool{}
 	for id, e := range s.Isolated {
 		if id == excludedNow {
 			still[id] = true

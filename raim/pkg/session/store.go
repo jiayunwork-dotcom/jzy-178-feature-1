@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"raim/pkg/apierr"
+	"raim/pkg/gnss"
 	"raim/pkg/profile"
 	"raim/pkg/statem"
 )
@@ -136,6 +137,10 @@ func (st *Store) CreateSession(id, profileName string) (*Session, error) {
 }
 
 // GetSession 读取会话（重启后续跑）。
+//
+// 升级前落盘的会话没有系统标识：隔离 map 的键是裸编号（SatKey.UnmarshalText
+// 已把它解释成 GPS:3）；此处再补齐 entry.sat 字段。旧历元记录原样读入，
+// 绝不改写、不重算。
 func (st *Store) GetSession(id string) (*Session, error) {
 	var sess Session
 	if err := readJSON(st.sessionPath(id), &sess); err != nil {
@@ -145,7 +150,12 @@ func (st *Store) GetSession(id string) (*Session, error) {
 		return nil, err
 	}
 	if sess.State.Isolated == nil {
-		sess.State.Isolated = map[int]*statem.IsolationEntry{}
+		sess.State.Isolated = map[gnss.SatKey]*statem.IsolationEntry{}
+	}
+	for k, e := range sess.State.Isolated {
+		if e.Sat == (gnss.SatKey{}) {
+			e.Sat = k
+		}
 	}
 	return &sess, nil
 }
@@ -270,11 +280,11 @@ func sanitize(name string) string {
 func cloneState(s statem.State) statem.State {
 	out := statem.State{
 		Alert:    s.Alert,
-		Isolated: map[int]*statem.IsolationEntry{},
+		Isolated: map[gnss.SatKey]*statem.IsolationEntry{},
 	}
-	for id, e := range s.Isolated {
+	for k, e := range s.Isolated {
 		cp := *e
-		out.Isolated[id] = &cp
+		out.Isolated[k] = &cp
 	}
 	return out
 }

@@ -1,6 +1,13 @@
 // Package session 实现回放会话：绑定运行档、逐历元（或批量）提交，
-// 编排“单历元定位/检测/排除/保护级”与“跨历元隔离、告警状态机”，
+// 编排“单历元多模定位/检测/排除/保护级”与“跨历元隔离、告警状态机”，
 // 并做时间戳去重/倒退校验与统计。
+//
+// 多模要点：
+//   - 同一历元的 GPS/GAL/BDS 伪距一起进入定位、检测、排除与保护级；
+//   - 每套参与系统各有一个钟差未知量（ISB 由钟差列之差体现），按每历元
+//     自由未知量估计，不跨历元携带（选型理由见 docs/design.md）；
+//   - 卫星一律按“系统+编号”区分：GPS 3 号与北斗 3 号是两颗不同的星；
+//   - 无系统标识的星一律按 GPS（升级前会话/运行档直接接着提交）。
 //
 // 同一段数据无论一次性批量提交还是逐历元实时提交，都走同一个 Step，
 // 因此逐历元结果严格一致；状态持久化后重启续跑同样复用该 Step。
@@ -16,28 +23,31 @@ import (
 	"raim/pkg/chisq"
 	"raim/pkg/detect"
 	"raim/pkg/geo"
+	"raim/pkg/gnss"
 	"raim/pkg/lsq"
 	"raim/pkg/profile"
 	"raim/pkg/protect"
 	"raim/pkg/statem"
 )
 
-// sortedIsolated 返回当前隔离且本历元可见的星编号（升序）。
-func sortedIsolated(isolated map[int]*statem.IsolationEntry, visible map[int]bool) []int {
-	var ids []int
-	for id := range isolated {
-		if visible[id] {
-			ids = append(ids, id)
+// sortedIsolatedKeys 返回当前隔离且本历元可见的卫星主键（系统次序 GPS<GAL<BDS，再按编号）。
+func sortedIsolatedKeys(isolated map[gnss.SatKey]*statem.IsolationEntry,
+	visible map[gnss.SatKey]bool) []gnss.SatKey {
+	var keys []gnss.SatKey
+	for k := range isolated {
+		if visible[k] {
+			keys = append(keys, k)
 		}
 	}
-	sort.Ints(ids)
-	return ids
+	sort.Slice(keys, func(i, j int) bool { return gnss.Less(keys[i], keys[j]) })
+	return keys
 }
 
-// SatInput 是调用方提交的单星观测。
+// SatInput 是调用方提交的单星观测。Sys 为所属系统标识，省略按 GPS。
 type SatInput struct {
 	ID    int        `json:"id"`
-	Pos   [3]float64 `json:"pos"` // ECEF x,y,z
+	Sys   string     `json:"sys,omitempty"` // GPS/GAL/BDS，大小写不敏感；空=GPS
+	Pos   [3]float64 `json:"pos"`           // ECEF x,y,z
 	PR    float64    `json:"pr"`
 	Sigma float64    `json:"sigma"`
 }
@@ -47,6 +57,30 @@ type EpochInput struct {
 	Timestamp int64       `json:"timestamp"` // 单调时间戳（任意单位，如 Unix 秒）
 	Approx    *[3]float64 `json:"approx,omitempty"`
 	Sats      []SatInput  `json:"satellites"`
+}
+
+// SatRef 用“系统+编号”引用一颗卫星；GPS 星省略系统字段（升级前兼容）。
+type SatRef struct {
+	Sys gnss.System `json:"sys,omitempty"`
+	ID  int         `json:"id"`
+}
+
+func refOf(k gnss.SatKey) SatRef {
+	sys := k.Sys
+	if sys == gnss.GPS {
+		sys = ""
+	}
+	return SatRef{Sys: sys, ID: k.ID}
+}
+
+// SysClockResult 给出一套系统在某历元的时间偏差估计与参与情况。
+type SysClockResult struct {
+	Sys          gnss.System `json:"sys"`
+	Participated bool        `json:"participated"`                // 本历元是否实际参与报告的定位解
+	Visible      int         `json:"visible"`                     // 本历元可见星数
+	Used         int         `json:"used"`                        // 实际参与解算的星数
+	ClockBias    float64     `json:"clock_bias,omitempty"`        // 该系统接收机钟差（米）；未参与省略
+	ISB          float64     `json:"inter_system_bias,omitempty"` // 相对参考系统（优先 GPS）的时间偏差（米）
 }
 
 // EpochRecord 是一个历元的完整判定快照（逐历元结果）。
@@ -63,17 +97,20 @@ type EpochRecord struct {
 	DOF         int     `json:"dof"`
 
 	// 单历元结果
-	Mode       string             `json:"mode"` // ok/unavailable/detected/excluded
-	SSE        float64            `json:"sse"`
-	HPL        float64            `json:"hpl"`
-	ExcludedID int                `json:"excluded_id,omitempty"`
-	Isolated   []int              `json:"isolated"` // 本历元处于隔离（不参与解算）的星
-	Position   Position           `json:"position"`
-	ClockBias  float64            `json:"clock_bias"`
-	Iterations int                `json:"iterations"`
-	Converged  bool               `json:"converged"`
-	SatResults []detect.SatResult `json:"sat_results"`
-	Trials     []detect.Trial     `json:"trials,omitempty"`
+	Mode         string             `json:"mode"` // ok/unavailable/detected/excluded
+	SSE          float64            `json:"sse"`
+	HPL          float64            `json:"hpl"`
+	ExcludedID   int                `json:"excluded_id,omitempty"`
+	ExcludedSys  gnss.System        `json:"excluded_sys,omitempty"`
+	Isolated     []int              `json:"isolated"`                // 本历元处于隔离（不参与解算）的星编号
+	IsolatedSats []SatRef           `json:"isolated_sats,omitempty"` // 多模历元：带系统的隔离星主键
+	Systems      []SysClockResult   `json:"systems,omitempty"`       // 多模历元：各系统钟差与参与情况
+	Position     Position           `json:"position"`
+	ClockBias    float64            `json:"clock_bias"`
+	Iterations   int                `json:"iterations"`
+	Converged    bool               `json:"converged"`
+	SatResults   []detect.SatResult `json:"sat_results"`
+	Trials       []detect.Trial     `json:"trials,omitempty"`
 
 	// 跨历元状态
 	Alert      bool `json:"alert"`
@@ -151,6 +188,53 @@ func (svc *Service) NewSession(id, profileName string) (*Session, error) {
 	}, nil
 }
 
+// validateEpochInput 在解算前做调用方输入校验（错误指到具体字段）。
+// 更深一层的几何/近地心等校验仍由 lsq.Validate 负责。
+func validateEpochInput(in EpochInput) error {
+	if len(in.Sats) < 4 {
+		return apierr.New("satellites",
+			fmt.Sprintf("历元 %d 可见星 %d 颗，不足 4 颗", in.Timestamp, len(in.Sats)))
+	}
+	seen := map[gnss.SatKey]bool{}
+	for i := range in.Sats {
+		s := &in.Sats[i]
+		field := func(name string) string {
+			return "satellites[" + itoa(i) + "]." + name
+		}
+		sys, ok := gnss.ParseSystem(s.Sys)
+		if !ok {
+			return apierr.New(field("sys"),
+				fmt.Sprintf("未知卫星系统标识 %q（仅支持 GPS/GAL/BDS，缺省按 GPS）", s.Sys))
+		}
+		if s.ID <= 0 {
+			return apierr.New(field("id"), "卫星编号必须为正整数")
+		}
+		key := gnss.Key(sys, s.ID)
+		if seen[key] {
+			return apierr.New(field("id"),
+				"同一系统内卫星编号出现两次（跨系统同号是不同的星，允许重号）")
+		}
+		seen[key] = true
+		if badFloat(s.Pos[0]) || badFloat(s.Pos[1]) || badFloat(s.Pos[2]) {
+			return apierr.New(field("pos"), "卫星坐标含 NaN 或无穷")
+		}
+		if badFloat(s.PR) {
+			return apierr.New(field("pr"), "伪距含 NaN 或无穷")
+		}
+		if badFloat(s.Sigma) || s.Sigma <= 0 {
+			return apierr.New(field("sigma"), "伪距误差标准差必须为有限正数")
+		}
+	}
+	if in.Approx != nil {
+		if badFloat((*in.Approx)[0]) || badFloat((*in.Approx)[1]) || badFloat((*in.Approx)[2]) {
+			return apierr.New("approx", "概略位置含 NaN 或无穷")
+		}
+	}
+	return nil
+}
+
+func badFloat(x float64) bool { return math.IsNaN(x) || math.IsInf(x, 0) }
+
 // Step 处理一个历元并返回该历元记录。重复/倒退时间戳分别返回哨兵错误，不推进状态。
 func (svc *Service) Step(sess *Session, in EpochInput) (*EpochRecord, error) {
 	prof, ok := svc.profiles[sess.ProfileName]
@@ -165,15 +249,18 @@ func (svc *Service) Step(sess *Session, in EpochInput) (*EpochRecord, error) {
 			return nil, apierr.ErrStaleEpoch
 		}
 	}
-	if len(in.Sats) < 4 {
-		return nil, apierr.New("satellites",
-			fmt.Sprintf("历元 %d 可见星 %d 颗，不足 4 颗", in.Timestamp, len(in.Sats)))
+	if err := validateEpochInput(in); err != nil {
+		return nil, err
 	}
 
-	visible := map[int]bool{}
+	visible := map[gnss.SatKey]bool{}
+	visibleSys := map[gnss.System]int{}
 	for _, s := range in.Sats {
-		visible[s.ID] = true
+		sys, _ := gnss.ParseSystem(s.Sys)
+		visible[gnss.Key(sys, s.ID)] = true
+		visibleSys[sys]++
 	}
+	multi := len(visibleSys) > 1
 	approx := svc.approxFor(sess, in)
 
 	rec := &EpochRecord{
@@ -188,7 +275,8 @@ func (svc *Service) Step(sess *Session, in EpochInput) (*EpochRecord, error) {
 	// 1) 活动星（剔除隔离星）
 	var active []lsq.Satellite
 	for _, s := range in.Sats {
-		if sess.State.Isolated[s.ID] != nil {
+		sys, _ := gnss.ParseSystem(s.Sys)
+		if sess.State.Isolated[gnss.Key(sys, s.ID)] != nil {
 			continue
 		}
 		active = append(active, toLSQSat(s))
@@ -197,46 +285,72 @@ func (svc *Service) Step(sess *Session, in EpochInput) (*EpochRecord, error) {
 	// 2) 单历元检测/排除
 	ep := &lsq.Epoch{Approx: approx, Sats: active}
 	if len(active) < 4 {
-		svc.fillUnusable(sess, prof, rec, "隔离后活动星不足 4 颗，无法定位", visible)
+		svc.fillUnusable(sess, prof, rec, in,
+			"隔离后活动星不足 4 颗，无法定位", visible, multi, visibleSys)
 	} else {
 		a, err := detect.Assess(ep, detect.Options{Pfa: prof.Pfa})
 		if err != nil {
-			return nil, err
+			// 走到这里的错误只可能是隔离后星数不足/几何退化（脏字段已在入口拦下），
+			// 按本历元完好性不可用处理而不是拒收整段。
+			reason := "活动星无法定位"
+			if fe, ok := err.(*apierr.FieldError); ok {
+				reason = "活动星无法定位：" + fe.Reason
+			}
+			svc.fillUnusable(sess, prof, rec, in, reason, visible, multi, visibleSys)
+			svc.finishEpoch(sess, in, rec, visible, multi)
+			return rec, nil
 		}
 		svc.fillFromAssessment(prof, rec, a)
+		fillSystems(rec, in, a.Sol, visibleSys)
 		// 3) 隔离星恢复评估（隔离期间仍逐历元算检验量）
 		recovery := svc.evalRecovery(prof, in, sess.State.Isolated, approx)
 		// 4) 推进隔离状态
-		newExcluded := 0
+		var newExcluded gnss.SatKey
 		if rec.Mode == string(detect.ModeExcluded) {
-			newExcluded = rec.ExcludedID
+			newExcluded = a.ExcludedKey()
 		}
 		sess.State.UpdateIsolation(prof, newExcluded, recovery, visible, rec.Seq)
 		// 5) 告警
 		svc.stepAlertAndStats(sess, prof, rec)
 	}
 
-	rec.Isolated = sortedIsolated(sess.State.Isolated, visible)
-
-	// 6) 落账
-	svc.commit(sess, in.Timestamp, rec)
+	svc.finishEpoch(sess, in, rec, visible, multi)
 	return rec, nil
 }
 
+// finishEpoch 写隔离列表并落账（正常路径与不可用路径共用）。
+func (svc *Service) finishEpoch(sess *Session, in EpochInput, rec *EpochRecord,
+	visible map[gnss.SatKey]bool, multi bool) {
+	keys := sortedIsolatedKeys(sess.State.Isolated, visible)
+	rec.Isolated = make([]int, 0, len(keys))
+	for _, k := range keys {
+		rec.Isolated = append(rec.Isolated, k.ID)
+	}
+	if multi {
+		rec.IsolatedSats = make([]SatRef, 0, len(keys))
+		for _, k := range keys {
+			rec.IsolatedSats = append(rec.IsolatedSats, refOf(k))
+		}
+	}
+	svc.commit(sess, in.Timestamp, rec)
+}
+
 func (svc *Service) fillUnusable(sess *Session, prof profile.Profile,
-	rec *EpochRecord, reason string, visible map[int]bool) {
+	rec *EpochRecord, in EpochInput, reason string,
+	visible map[gnss.SatKey]bool, multi bool, visibleSys map[gnss.System]int) {
 	rec.Mode = string(detect.ModeUnavailable)
 	rec.RAIMAvail = false
 	rec.Reason = reason
-	// 活动星不足时隔离计数仍按“不可见/无法评估”处理：可见性以原观测为准，
-	// 但恢复评估依赖定位，无法完成，故所有隔离星 streak 清零（Normal=false）。
+	fillSystems(rec, in, nil, visibleSys)
+	// 活动星不足时隔离计数按“不可见/无法评估”处理：恢复评估依赖定位，
+	// 无法完成，故所有本历元可见的隔离星 streak 清零（Normal=false）。
 	var recovery []statem.SatRecovery
-	for id := range sess.State.Isolated {
-		if visible[id] {
-			recovery = append(recovery, statem.SatRecovery{ID: id, Normal: false})
+	for k := range sess.State.Isolated {
+		if visible[k] {
+			recovery = append(recovery, statem.SatRecovery{Sat: k, Normal: false})
 		}
 	}
-	sess.State.UpdateIsolation(prof, 0, recovery, visible, rec.Seq)
+	sess.State.UpdateIsolation(prof, gnss.SatKey{}, recovery, visible, rec.Seq)
 	svc.stepAlert(sess, prof, rec, statem.EpochStatus{
 		IntegrityAvailable: false, IntegrityBad: true,
 	})
@@ -252,6 +366,7 @@ func (svc *Service) fillFromAssessment(prof profile.Profile,
 	rec.Trials = a.Trials
 	rec.Reason = a.Reason
 	rec.ExcludedID = a.ExcludedID
+	rec.ExcludedSys = a.ExcludedSys
 	if a.Sol != nil {
 		rec.Position = Position{
 			ECEF: [3]float64{a.Sol.Pos.X, a.Sol.Pos.Y, a.Sol.Pos.Z},
@@ -261,9 +376,56 @@ func (svc *Service) fillFromAssessment(prof profile.Profile,
 		rec.Iterations = a.Sol.Iter
 		rec.Converged = a.Sol.Converged
 	}
-	rec.RAIMAvail = a.Used >= 5
+	// RAIM 可用 ⇔ 全解存在冗余（dof≥1）；单 GPS 即升级前的 Used≥5。
+	rec.RAIMAvail = a.DOF >= 1
 	if rec.RAIMAvail {
 		rec.HPL = protect.AssessmentHPL(a, prof.Pmd)
+	}
+}
+
+// fillSystems 汇总各系统本历元的参与情况与钟差估计。
+// sol 为报告解（排除后为干净子集解；不可用时为 nil）。
+func fillSystems(rec *EpochRecord, in EpochInput, sol *lsq.Solution,
+	visibleSys map[gnss.System]int) {
+	if len(visibleSys) <= 1 {
+		return // 单 GPS 历元不输出多系统字段（与升级前记录保持一致）
+	}
+	// 参考系统：报告解中按规范次序（GPS 优先）第一个参与系统。
+	var refSys gnss.System
+	refClock := 0.0
+	if sol != nil {
+		for _, sys := range gnss.All {
+			if c, ok := sol.ClockOf(sys); ok {
+				refSys, refClock = sys, c
+				break
+			}
+		}
+	}
+	usedCount := map[gnss.System]int{}
+	if sol != nil {
+		for _, sys := range sol.RowSys {
+			usedCount[sys]++
+		}
+	}
+	for _, sys := range gnss.All {
+		nv := visibleSys[sys]
+		if nv == 0 {
+			continue
+		}
+		r := SysClockResult{Sys: sys, Visible: nv}
+		if sol != nil {
+			if c, ok := sol.ClockOf(sys); ok {
+				r.Participated = true
+				r.Used = usedCount[sys]
+				r.ClockBias = c
+				if sys == refSys {
+					r.ISB = 0
+				} else {
+					r.ISB = c - refClock
+				}
+			}
+		}
+		rec.Systems = append(rec.Systems, r)
 	}
 }
 
@@ -364,57 +526,74 @@ func firstSatApprox(in EpochInput) geo.Vec {
 //   - 本星在含自身的全解中标准化残差正常；
 //   - 把它加回去后整体检验通过（SSE ≤ 阈值）。
 //
-// 两者同时满足才算一个恢复历元。
+// 两者同时满足才算一个恢复历元。全部隔离星共用同一个“含所有可见星”的全解。
 func (svc *Service) evalRecovery(prof profile.Profile, in EpochInput,
-	isolated map[int]*statem.IsolationEntry, approx geo.Vec) []statem.SatRecovery {
+	isolated map[gnss.SatKey]*statem.IsolationEntry, approx geo.Vec) []statem.SatRecovery {
 	if len(isolated) == 0 {
 		return nil
 	}
 	all := make([]lsq.Satellite, 0, len(in.Sats))
-	byID := map[int]lsq.Satellite{}
+	byKey := map[gnss.SatKey]lsq.Satellite{}
 	for _, s := range in.Sats {
 		l := toLSQSat(s)
 		all = append(all, l)
-		byID[s.ID] = l
+		byKey[l.Key()] = l
 	}
 	var out []statem.SatRecovery
-	for id := range isolated {
-		if _, ok := byID[id]; !ok {
+	// 解一次即可（全解与被评估的具体隔离星无关）。
+	sol, solErr := lsq.Solve(&lsq.Epoch{Approx: approx, Sats: all})
+	for k := range isolated {
+		if _, ok := byKey[k]; !ok {
 			continue // 不可见：上层 UpdateIsolation 会清零
 		}
-		sol, err := lsq.Solve(&lsq.Epoch{Approx: approx, Sats: all})
-		if err != nil {
-			out = append(out, statem.SatRecovery{ID: id, Normal: false})
+		if solErr != nil {
+			out = append(out, statem.SatRecovery{Sat: k, Normal: false})
 			continue
 		}
-		sse, dof := lsq.WeightedSSE(sol.Resid, sol.Sigma)
+		sse, dof := sol.SSE()
 		overallPass := false
 		selfZ := 0.0
-		if dof > 0 {
+		if dof >= 1 {
 			thr := chisq.Threshold(dof, prof.Pfa)
 			overallPass = sse <= thr
 			for i, s := range all {
-				if s.ID == id {
+				if s.Key() == k {
 					selfZ = math.Abs(sol.Resid[i]) / s.Sigma
 					break
 				}
 			}
 			// 单星正常门限取 √thr（与整体卡方阈值一致的保守判据）
 			if overallPass && selfZ <= math.Sqrt(thr) {
-				out = append(out, statem.SatRecovery{ID: id, Normal: true})
+				out = append(out, statem.SatRecovery{Sat: k, Normal: true})
 				continue
 			}
 		}
-		out = append(out, statem.SatRecovery{ID: id, Normal: false})
+		out = append(out, statem.SatRecovery{Sat: k, Normal: false})
 	}
 	return out
 }
 
 func toLSQSat(s SatInput) lsq.Satellite {
+	sys, _ := gnss.ParseSystem(s.Sys)
 	return lsq.Satellite{
 		ID:    s.ID,
+		Sys:   sys,
 		Pos:   geo.Vec{X: s.Pos[0], Y: s.Pos[1], Z: s.Pos[2]},
 		PR:    s.PR,
 		Sigma: s.Sigma,
 	}
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	pos := len(b)
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(b[pos:])
 }
